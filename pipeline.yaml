@@ -1,0 +1,1099 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure deployment pipeline version: v1.0'
+
+Parameters:
+  BuildImageName:
+    Description: Docker image for application build
+    Type: String
+    Default: aws/codebuild/standard:4.0
+  DevAwsAccountId:
+    Description: AWS account ID for development account
+    Default: ""
+    Type: String
+    AllowedPattern: (\d{12}|^$)
+    ConstraintDescription: Must be an AWS account ID
+  TestAwsAccountId:
+    Description: AWS account ID for test account
+    Default: ""
+    Type: String
+    AllowedPattern: (\d{12}|^$)
+    ConstraintDescription: Must be an AWS account ID
+  ProdAwsAccountId:
+    Description: AWS account ID for test account
+    Default: ""
+    Type: String
+    AllowedPattern: (\d{12}|^$)
+    ConstraintDescription: Must be an AWS account ID
+  Branch:
+    Description: Repository branch name
+    Type: String
+    Default: master
+  BranchName:
+    Description: Repository branch name for codecommit - this should be exact branch name.  Automatically set by PipelineEngine
+    Type: String
+  TargetAccountRoleName:
+    Description: The name of the role to create in the development account.
+    Default: pipeline-bp-role
+    Type: String
+  SlackChannel:
+    Description: The name of the slack channel under the slack workspace in AWS ChatBot to use for notifications
+    Default: dph-notifications-channel
+    Type: String
+  ProjectPrefix:
+    Description: Prefix used for project resources
+    Type: String
+    Default: "dph"
+  AppName:
+    Description: Application name used in pipeline.
+    Type: String
+  PipelineApprovalEmail:
+    Description: Email Address for Production Pipeline Approvals
+    Type: String
+    Default: ''
+  EnablePipelineTrigger:
+    Description: Set to 'true' to enable pipeline start execution via CloudWatch event
+    Type: String
+    Default: 'false'
+  PollForSourceChanges:
+    Description: Set to 'true' to enable pipeline to auto-detect source changes.  This is enabeld in 'release' branches by PipelineEngine. 
+    Type: String
+    Default: 'false'
+
+Conditions:
+  IsPipelineTrigger: !Equals [!Ref EnablePipelineTrigger, 'true']
+  IsNotPipelineTrigger: !Equals [!Ref EnablePipelineTrigger, 'false']
+  IsNotRelease: !Equals [!Ref Branch, 'master']
+  IsRelease: !Equals [!Ref Branch, 'release']
+  IsPipelineApprovalStageCondition: !And
+    - !Not [!Equals [!Ref PipelineApprovalEmail, '']]
+    - !Condition IsRelease  
+  IsTestEnvironmentEnabled: !And
+    - !And
+      - !Not [!Equals [!Ref TestAwsAccountId, '']]
+      - !Condition IsNotRelease  
+    - !And
+      - !Not [!Equals [!Ref TestAwsAccountId, !Ref 'DevAwsAccountId']]
+      - !Condition IsNotRelease  
+      
+Resources:
+##########################################################################################################################
+# Master & Release Workflow - CodePipeline S3 Bucket
+##########################################################################################################################     
+  ArtifactBucket:
+    Condition: IsNotRelease
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID:
+                Fn::ImportValue:
+                  !Sub "${ProjectPrefix}-pipeline-CICDBucketKeyArn"
+              SSEAlgorithm: aws:kms
+
+  ArtifactBucketPolicy:
+    Condition: IsNotRelease
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:*
+            Effect: Allow
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub ${ArtifactBucket.Arn}/*
+            Principal:
+              AWS:
+                - !GetAtt PipelineServiceRole.Arn
+          - Action:
+            #   - s3:GetObject
+            #   - s3:PutObject
+            #   - s3:ListBucket
+              - s3:*
+            Effect: Allow
+            Resource:
+              - !Sub arn:aws:s3:::${ArtifactBucket}
+              - !Sub arn:aws:s3:::${ArtifactBucket}/*
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${DevAwsAccountId}:root
+                - !If
+                  - IsTestEnvironmentEnabled
+                  - !Sub arn:aws:iam::${TestAwsAccountId}:root
+                  - !Ref AWS::NoValue
+
+##########################################################################################################################
+# Release Workflow - CodePipeline S3 Bucket
+##########################################################################################################################
+  ReleaseArtifactBucket:
+    Condition: IsRelease
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID:
+                Fn::ImportValue:
+                  !Sub "${ProjectPrefix}-pipeline-CICDBucketKeyArn"
+              SSEAlgorithm: aws:kms
+
+  ReleaseArtifactBucketPolicy:
+    Condition: IsRelease
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReleaseArtifactBucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:*
+            Effect: Allow
+            Resource:
+              - !GetAtt ReleaseArtifactBucket.Arn
+              - !Sub ${ReleaseArtifactBucket.Arn}/*
+            Principal:
+              AWS:
+                - !GetAtt PipelineServiceRole.Arn
+          - Action:
+            #   - s3:GetObject
+            #   - s3:PutObject
+            #   - s3:ListBucket
+              - s3:*
+            Effect: Allow
+            Resource:
+              - !Sub arn:aws:s3:::${ReleaseArtifactBucket}
+              - !Sub arn:aws:s3:::${ReleaseArtifactBucket}/*
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${ProdAwsAccountId}:root
+
+##########################################################################################################################
+# Release Workflow - Manual SNS Approval
+##########################################################################################################################
+  PipelineSnsTopic:
+    Condition: IsPipelineApprovalStageCondition
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AppName}-pipeline-topic-${Branch}"
+
+  PipelineSnsSubscription:
+    Condition: IsPipelineApprovalStageCondition
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref PipelineApprovalEmail
+      Protocol: email
+      TopicArn: !Ref PipelineSnsTopic
+
+##########################################################################################################################
+# Master & Release Workflow - PipelineServiceRole IAM Role
+##########################################################################################################################
+  PipelineServiceRole:
+    Condition: IsNotPipelineTrigger
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/boundary-role
+      RoleName: !Sub ${AppName}-PipelineServiceRole-${Branch}
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref AWS::AccountId
+              Service:
+                - codepipeline.amazonaws.com
+                - codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - codebuild:*
+                - codebuild:StartBuild
+                - codebuild:BatchGetBuilds
+                Effect: Allow
+                Resource: "*"
+        - PolicyName: CodeCommitAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Resource: !Sub "arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${AppName}"
+                Effect: Allow
+                Action:
+                    - codecommit:GetBranch
+                    - codecommit:GetCommit
+                    - codecommit:UploadArchive
+                    - codecommit:GetUploadArchiveStatus
+                    - codecommit:CancelUploadArchive
+                    - codecommit:*
+        - PolicyName: KMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                  - sns:Publish
+                  - lambda:Invoke*
+                  - Lambda:List*
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ecr:GetAuthorizationToken
+        - !If
+          - IsNotRelease
+          - PolicyName: S3PipelineAccess
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: "Allow"
+                  Action:
+                    - s3:GetBucketVersioning
+                    - s3:PutObject
+                    - s3:GetObject
+                    - s3:GetObjectVersion
+                  Resource:
+                    - !GetAtt ArtifactBucket.Arn
+                    - Fn::Sub:
+                      - "${DeploymentBucketArn}/*"
+                      - DeploymentBucketArn: !ImportValue "dph-pipeline-DeploymentBucketArn"
+          - !Ref AWS::NoValue
+        - !If
+          - IsRelease
+          - PolicyName: ReleaseS3PipelineAccess
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: "Allow"
+                  Action:
+                    - s3:GetBucketVersioning
+                    - s3:PutObject
+                    - s3:GetObject
+                    - s3:GetObjectVersion
+                  Resource:
+                    - !GetAtt ReleaseArtifactBucket.Arn
+                    - Fn::Sub:
+                      - "${DeploymentBucketArn}/*"
+                      - DeploymentBucketArn: !ImportValue "dph-pipeline-DeploymentBucketArn"
+          - !Ref AWS::NoValue
+
+        - !If
+          - IsNotRelease
+          - PolicyName: IAMAccessForDev
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Resource:
+                  - !Sub arn:aws:iam::${DevAwsAccountId}:role/${AppName}-PipelineServiceRole-${Branch}-dev
+                  # - !Sub arn:aws:iam::${DevAwsAccountId}:role/${AppName}-PipelineDeploymentRole-${Branch}-dev
+                  - !Sub arn:aws:iam::${DevAwsAccountId}:role/dph-pipeline-bp-role
+                  Effect: Allow
+                  Action:
+                    - sts:AssumeRole
+          - !Ref AWS::NoValue
+
+        - !If
+          - IsTestEnvironmentEnabled
+          - PolicyName: IAMAccessForTest
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Resource:
+                  - !Sub arn:aws:iam::${TestAwsAccountId}:role/${AppName}-PipelineServiceRole-${Branch}-test
+                  # - !Sub arn:aws:iam::${TestAwsAccountId}:role/${AppName}-PipelineDeploymentRole-${Branch}-test
+                  - !Sub arn:aws:iam::${TestAwsAccountId}:role/dph-pipeline-bp-role
+                  Effect: Allow
+                  Action:
+                    - sts:AssumeRole
+          - !Ref AWS::NoValue
+
+        - !If
+          - IsRelease
+          - PolicyName: IAMAccessForProd
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Resource:
+                  - !Sub arn:aws:iam::${ProdAwsAccountId}:role/${AppName}-PipelineServiceRole-${Branch}-prod
+                  # - !Sub arn:aws:iam::${ProdAwsAccountId}:role/${AppName}-PipelineDeploymentRole-${Branch}-prod
+                  - !Sub arn:aws:iam::${ProdAwsAccountId}:role/dph-pipeline-bp-role
+                  Effect: Allow
+                  Action:
+                    - sts:AssumeRole
+          - !Ref AWS::NoValue
+        - !If
+          - IsPipelineApprovalStageCondition
+          - PolicyName: SNSAccess
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: "Allow"
+                  Action:
+                    - sns:publish
+                  Resource:
+                    - !Ref PipelineSnsTopic   # SNS Topic for Pipeline
+          - !Ref AWS::NoValue
+
+##########################################################################################################################
+# Master & Release Workflow - Pipeline
+##########################################################################################################################                  
+  Pipeline:
+    Condition: IsNotPipelineTrigger
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${AppName}-pipeline-${Branch}
+      RoleArn: !GetAtt PipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !If [IsRelease, !Ref ReleaseArtifactBucket, !Ref ArtifactBucket]
+        EncryptionKey:
+          Id:
+            Fn::ImportValue:
+              !Sub "${ProjectPrefix}-pipeline-CICDBucketKeyArn"
+          Type: KMS
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: CodeCommitSourceAction
+              RunOrder: 1
+              ActionTypeId:
+                Category: Source
+                Provider: CodeCommit
+                Owner: AWS
+                Version: '1'
+              OutputArtifacts:
+                - Name: Source
+              Configuration:
+                RepositoryName: !Sub ${AppName}
+                BranchName: !Ref BranchName
+                PollForSourceChanges: !Ref PollForSourceChanges
+            
+        - !If
+          - IsNotRelease
+          - Name: DeployToDev
+            Actions:
+              - Name: CreateChangeSet
+                RunOrder: 1
+                InputArtifacts:
+                  - Name: Source
+                ActionTypeId:
+                  Category: Deploy
+                  Provider: CloudFormation
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  ActionMode: CHANGE_SET_REPLACE
+                  Capabilities: "CAPABILITY_IAM,CAPABILITY_NAMED_IAM"
+                  ChangeSetName: !Sub ${AppName}-change-set-${Branch}
+                  RoleArn: !Sub arn:aws:iam::${DevAwsAccountId}:role/${AppName}-PipelineDeploymentRole-${Branch}-dev
+                  StackName: !Sub ${AppName}-${Branch}-dev
+                  TemplatePath: Source::templates/init.yaml
+                  TemplateConfiguration: Source::conf/dev.json
+                RoleArn: !Sub arn:aws:iam::${DevAwsAccountId}:role/${AppName}-PipelineServiceRole-${Branch}-dev
+              - Name: DeployChangeSet
+                RunOrder: 2
+                ActionTypeId:
+                  Category: Deploy
+                  Provider: CloudFormation
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  ActionMode: CHANGE_SET_EXECUTE
+                  Capabilities: "CAPABILITY_IAM,CAPABILITY_NAMED_IAM"
+                  ChangeSetName: !Sub ${AppName}-change-set-${Branch}
+                  RoleArn: !Sub arn:aws:iam::${DevAwsAccountId}:role/${AppName}-PipelineDeploymentRole-${Branch}-dev
+                  StackName: !Sub ${AppName}-${Branch}-dev
+                RoleArn: !Sub arn:aws:iam::${DevAwsAccountId}:role/${AppName}-PipelineServiceRole-${Branch}-dev
+          - !Ref AWS::NoValue
+
+        - !If
+          - IsTestEnvironmentEnabled
+          - Name: DeployToTest
+            Actions:
+              - Name: CreateChangeSet
+                RunOrder: 1
+                InputArtifacts:
+                  - Name: Source
+                ActionTypeId:
+                  Category: Deploy
+                  Provider: CloudFormation
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  ActionMode: CHANGE_SET_REPLACE
+                  Capabilities: "CAPABILITY_IAM,CAPABILITY_NAMED_IAM"
+                  ChangeSetName: !Sub ${AppName}-change-set-${Branch}
+                  RoleArn: !Sub arn:aws:iam::${TestAwsAccountId}:role/${AppName}-PipelineDeploymentRole-${Branch}-test
+                  StackName: !Sub ${AppName}-${Branch}-test
+                  TemplatePath: Source::templates/init.yaml
+                  TemplateConfiguration: Source::conf/test.json
+                RoleArn: !Sub arn:aws:iam::${TestAwsAccountId}:role/${AppName}-PipelineServiceRole-${Branch}-test
+              - Name: DeployChangeSet
+                RunOrder: 2
+                ActionTypeId:
+                  Category: Deploy
+                  Provider: CloudFormation
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  ActionMode: CHANGE_SET_EXECUTE
+                  Capabilities: "CAPABILITY_IAM,CAPABILITY_NAMED_IAM"
+                  ChangeSetName: !Sub ${AppName}-change-set-${Branch}
+                  RoleArn: !Sub arn:aws:iam::${TestAwsAccountId}:role/${AppName}-PipelineDeploymentRole-${Branch}-test
+                  StackName: !Sub ${AppName}-${Branch}-test
+                RoleArn: !Sub arn:aws:iam::${TestAwsAccountId}:role/${AppName}-PipelineServiceRole-${Branch}-test
+          - !Ref AWS::NoValue
+
+        - !If
+          - IsRelease
+          - Name: DeployToProd
+            Actions:
+              - Name: CreateChangeSet
+                RunOrder: 1
+                InputArtifacts:
+                  - Name: Source
+                ActionTypeId:
+                  Category: Deploy
+                  Provider: CloudFormation
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  ActionMode: CHANGE_SET_REPLACE
+                  Capabilities: "CAPABILITY_IAM,CAPABILITY_NAMED_IAM"
+                  ChangeSetName: !Sub ${AppName}-change-set-${Branch}
+                  RoleArn: !Sub arn:aws:iam::${ProdAwsAccountId}:role/${AppName}-PipelineDeploymentRole-${Branch}-prod
+                  StackName: !Sub ${AppName}-${Branch}-prod
+                  TemplatePath: Source::templates/init.yaml
+                  TemplateConfiguration: Source::conf/prod.json
+                RoleArn: !Sub arn:aws:iam::${ProdAwsAccountId}:role/${AppName}-PipelineServiceRole-${Branch}-prod
+              - !If
+                - IsPipelineApprovalStageCondition
+                - Name: SnsApprovalToDeploy
+                  RunOrder: 2
+                  ActionTypeId:
+                    Category: Approval
+                    Owner: AWS
+                    Version: '1'
+                    Provider: Manual
+                  Configuration:
+                    NotificationArn: !Ref PipelineSnsTopic
+                - !Ref AWS::NoValue
+              - Name: DeployChangeSet
+                RunOrder: 3
+                ActionTypeId:
+                  Category: Deploy
+                  Provider: CloudFormation
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  ActionMode: CHANGE_SET_EXECUTE
+                  Capabilities: "CAPABILITY_IAM,CAPABILITY_NAMED_IAM"
+                  ChangeSetName: !Sub ${AppName}-change-set-${Branch}
+                  RoleArn: !Sub arn:aws:iam::${ProdAwsAccountId}:role/${AppName}-PipelineDeploymentRole-${Branch}-prod
+                  StackName: !Sub ${AppName}-${Branch}-prod
+                RoleArn: !Sub arn:aws:iam::${ProdAwsAccountId}:role/${AppName}-PipelineServiceRole-${Branch}-prod
+          - !Ref AWS::NoValue
+
+##########################################################################################################################
+# Pull Request Workflow
+##########################################################################################################################
+  ValidatePullRequest:
+    Condition: IsNotRelease
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AppName}-${Branch}-Validate-PR
+      Artifacts:
+        Type: NO_ARTIFACTS
+      BadgeEnabled: true
+      Description: !Sub 'Validate Pull Request for ${AppName}'
+      Environment:
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Type: LINUX_CONTAINER
+        Image: !Ref BuildImageName
+        EnvironmentVariables:
+          - Name: BRANCH
+            Value: !Ref Branch
+      QueuedTimeoutInMinutes: 10
+      ServiceRole: !GetAtt PipelineServiceRole.Arn
+      Source:
+        Type: CODECOMMIT
+        Location: !Sub "https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/${AppName}"
+        BuildSpec: buildspec.validate-pr.yaml
+      TimeoutInMinutes: 10
+
+  PullRequestTriggerCodeBuildRule:
+    Condition: IsNotRelease
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AppName}-${Branch}-ValidatePR-Rule
+      Description: 'Rule to trigger build from CodeCommit pull request'
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - 'CodeCommit Pull Request State Change'
+        detail:
+          event:
+            - pullRequestCreated
+            - pullRequestSourceBranchUpdated
+        resources:
+          - !Sub "arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${AppName}"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ValidatePullRequest.Arn
+          Id: codebuild
+          RoleArn: !GetAtt CloudWatchEventsCodeBuildRole.Arn
+          InputTransformer:
+            InputTemplate: |
+              {
+                "sourceVersion": <sourceVersion>,
+                "artifactsOverride": {"type": "NO_ARTIFACTS"},
+                "environmentVariablesOverride": [
+                   {
+                       "name": "PULL_REQUEST_ID",
+                       "value": <pullRequestId>,
+                       "type": "PLAINTEXT"
+                   },
+                   {
+                       "name": "REPOSITORY_NAME",
+                       "value": <repositoryName>,
+                       "type": "PLAINTEXT"
+                   },
+                   {
+                       "name": "SOURCE_COMMIT",
+                       "value": <sourceCommit>,
+                       "type": "PLAINTEXT"
+                   },
+                   {
+                       "name": "DESTINATION_COMMIT",
+                       "value": <destinationCommit>,
+                       "type": "PLAINTEXT"
+                   },
+                   {
+                      "name" : "REVISION_ID",
+                      "value": <revisionId>,
+                      "type": "PLAINTEXT"
+                   }
+                ]
+              }
+            InputPathsMap:
+              sourceVersion: "$.detail.sourceCommit"
+              pullRequestId: "$.detail.pullRequestId"
+              repositoryName: "$.detail.repositoryNames[0]"
+              sourceCommit: "$.detail.sourceCommit"
+              destinationCommit: "$.detail.destinationCommit"
+              revisionId: "$.detail.revisionId"
+
+  CloudWatchEventsCodeBuildRole:
+    Condition: IsNotRelease
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: events-invoke-codebuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Resource: !GetAtt ValidatePullRequest.Arn
+                Action:
+                  - codebuild:StartBuild
+
+##########################################################################################################################
+# Master Workflow - CodeStar Slack Integration
+##########################################################################################################################
+  CodeCommitCodeStarNotificationRule:
+    Condition: IsNotRelease
+    Type: 'AWS::CodeStarNotifications::NotificationRule'
+    Properties:
+      Name: !Sub "${AppName}-${Branch}-code"
+      DetailType: FULL
+      Resource: !Sub  "arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${AppName}"
+      EventTypeIds:
+          - codecommit-repository-approvals-status-changed
+          - codecommit-repository-approvals-rule-override
+          - codecommit-repository-pull-request-merged
+          - codecommit-repository-pull-request-created
+      Targets:
+          - TargetType: AWSChatbotSlack
+            TargetAddress: !Sub "arn:aws:chatbot::${AWS::AccountId}:chat-configuration/slack-channel/${SlackChannel}"
+
+  PipelineCodeStarNotificationRule:
+    Condition: IsNotRelease
+    Type: 'AWS::CodeStarNotifications::NotificationRule'
+    Properties:
+      Name: !Sub "${AppName}-${Branch}-pipe"
+      DetailType: FULL
+      Resource: 
+        Fn::Sub:
+          - "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PipelineId}"
+          - PipelineId: !Ref Pipeline
+      EventTypeIds:
+          - codepipeline-pipeline-stage-execution-failed
+      Targets:
+          - TargetType: AWSChatbotSlack
+            TargetAddress: !Sub "arn:aws:chatbot::${AWS::AccountId}:chat-configuration/slack-channel/${SlackChannel}"
+
+  PRCodeStarNotificationRule:
+    Condition: IsNotRelease
+    Type: 'AWS::CodeStarNotifications::NotificationRule'
+    Properties:
+      Name: !Sub "${AppName}-${Branch}-pr"
+      DetailType: FULL
+      Resource: !GetAtt ValidatePullRequest.Arn
+      EventTypeIds:
+          - codebuild-project-build-state-failed
+      Targets:
+          - TargetType: AWSChatbotSlack
+            TargetAddress: !Sub "arn:aws:chatbot::${AWS::AccountId}:chat-configuration/slack-channel/${SlackChannel}"
+
+
+##########################################################################################################################
+# Pipeline Trigger - CloudWatch Integration (StackName: ${AppName}-${BranchName}-pipeline-trigger)
+##########################################################################################################################
+  PipelineTriggerLambdaEventRule:
+    Condition: IsPipelineTrigger
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Rule to trigger pipeline'
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        detail:
+          event:
+            - referenceUpdated
+            - referenceCreated
+          referenceType:
+            - "branch"
+          # referenceName:
+          #   - "master"
+        resources:
+          - !Sub "arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${AppName}"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PipelineTriggerLambda.Arn
+          Id: pipeline
+
+  PermissionToInvokeLambda:
+    Condition: IsPipelineTrigger
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PipelineTriggerLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PipelineTriggerLambdaEventRule.Arn
+
+  PipelineTriggerLambda:
+    Condition: IsPipelineTrigger
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt PipelineTriggerLambdaRole.Arn
+      Runtime: python3.6
+      Timeout: 900
+      # Environment:
+      #   Variables:
+      #     CODEPIPELINE_NAME: !Ref Pipeline
+      #     REPOSITORY_NAME: !Sub "${AppName}"
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          codecommit_client = boto3.client('codecommit')
+          codepipeline_client = boto3.client('codepipeline')
+
+          def handler(event, context):
+
+              # Filter these files on pipeline execution
+              files_to_ignore = [ "readme.md", "pipeline.yaml" ]
+
+              # Extract commits
+              old_commit_id = event["detail"]["oldCommitId"]
+              new_commit_id = event["detail"]["commitId"]
+              repository_name = event["detail"]["repositoryName"]
+              branch = event["detail"]["referenceName"]
+              branch_stripped = branch.split('-')[0]
+              region = event["region"]
+              event_type = event["detail"]
+              codepipeline_name = repository_name + "-pipeline-" + branch_stripped
+
+              # Only support master and release workflows, no PR branches trigger pipeline
+              if branch_stripped not in ('master'):
+                  print("Not a master or release branch, skipping pipeline trigger.")
+                  return
+
+
+              # Get commit differences
+              print("Comparing old commit %s and new commit %s" % (old_commit_id, new_commit_id))
+              codecommit_response = codecommit_client.get_differences(
+                  repositoryName=repository_name,
+                  beforeCommitSpecifier=str(old_commit_id),
+                  afterCommitSpecifier=str(new_commit_id)
+              )
+
+              # Search commit differences for files to ignore
+              print("checking if the change only has files to ignore...")
+              for difference in codecommit_response["differences"]:
+                  file_name = difference["afterBlob"]["path"].lower()
+
+                  # If non-ignored file is present, kickoff pipeline
+                  if file_name not in files_to_ignore:
+                      print("Non-ignored file is present... kicking off pipeline")
+                      codepipeline_response = codepipeline_client.start_pipeline_execution(
+                        name=codepipeline_name
+                        )
+
+                      return {'statusCode': "Kicked off code deployment"}
+
+              return {'statusCode': "Did not kick off code deployment"}
+
+  PipelineTriggerLambdaRole:
+    Condition: IsPipelineTrigger
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/boundary-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: TriggerPipelineLambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                - 'codepipeline:StartPipelineExecution'
+                Resource:
+                - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AppName}-pipeline-master"
+                - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AppName}-pipeline-release"
+              - Effect: Allow
+                Action:
+                - 'codecommit:GetDifferences'
+                Resource:
+                - !Sub "arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${AppName}"
+              - Effect: Allow
+                Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Resource:
+                - arn:aws:logs:*:*:*
+      
+##########################################################################################################################
+# Cross Account Setup (DEV)
+##########################################################################################################################
+  DevCrossAccountSetupStack:
+    Condition: IsNotRelease
+    Type: "AWS::CloudFormation::CustomResource"
+    Version: '1.0'
+    Properties:
+      ServiceToken:
+        Fn::ImportValue:
+          !Sub "${ProjectPrefix}-pipeline-CrossAccountSetupLambdaArn"
+      RoleArn: !Sub arn:aws:iam::${DevAwsAccountId}:role/${ProjectPrefix}-${TargetAccountRoleName}
+      StackName: !Sub ${AppName}-pipeline-${Branch}-dev
+      Region: !Ref AWS::Region
+      CfnParameters:
+        SharedServiceAccountID: !Ref AWS::AccountId
+        AppName: !Ref AppName
+        Stage: dev
+        Branch: !Ref Branch
+      Capabilities:
+        - CAPABILITY_NAMED_IAM
+      TemplateBody: |
+        AWSTemplateFormatVersion: '2010-09-09'
+
+        Parameters:
+          SharedServiceAccountID:
+            Description: The AWS Account ID for the shared services account
+            Type: String
+            AllowedPattern: (\d{12}|^$)
+            ConstraintDescription: must be an AWS account id
+          AppName:
+            Description: App name to use for stack resources
+            Type: String
+          Stage:
+            Description: Environment
+            Type: String
+          Branch:
+            Description: Branch used to build environment
+            Type: String
+
+        Resources:
+          PipelineServiceRole:
+            Type: AWS::IAM::Role
+            Properties:
+              RoleName: !Sub ${AppName}-PipelineServiceRole-${Branch}-${Stage}
+              Path: /
+              AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      AWS: !Ref SharedServiceAccountID
+                      Service:
+                        - codepipeline.amazonaws.com
+                    Action: sts:AssumeRole
+              Policies:
+                - PolicyName: CloudFormationAdminAccess
+                  PolicyDocument:
+                    Version: '2012-10-17'
+                    Statement:
+                      - Resource: "*"
+                        Effect: Allow
+                        Action:
+                          - cloudformation:*
+                      - Resource: "*"
+                        Effect: Allow
+                        Action:
+                          - s3:GetObject
+                      - Resource: !Sub arn:aws:kms:${AWS::Region}:${SharedServiceAccountID}:*
+                        Effect: Allow
+                        Action:
+                          - kms:Decrypt
+                      - Resource: 
+                        - !GetAtt PipelineDeploymentRole.Arn
+                        - !Sub arn:aws:iam::${AWS::AccountId}:role/dph-pipeline-bp-role
+                        Effect: Allow
+                        Action:
+                          - iam:PassRole
+
+          PipelineDeploymentRole:
+            Type: AWS::IAM::Role
+            Properties:
+              RoleName: !Sub ${AppName}-PipelineDeploymentRole-${Branch}-${Stage}
+              Path: /
+              AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      AWS: !Ref SharedServiceAccountID
+                      Service:
+                        - cloudformation.amazonaws.com
+                        - codebuild.amazonaws.com
+                    Action: sts:AssumeRole
+              ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/AdministratorAccess
+
+
+##########################################################################################################################
+# Cross Account Setup (TEST)
+##########################################################################################################################                
+  TestCrossAccountSetupStack:
+    Condition: IsTestEnvironmentEnabled
+    Type: "AWS::CloudFormation::CustomResource"
+    Version: '1.0'
+    Properties:
+      ServiceToken:
+        Fn::ImportValue:
+          !Sub "${ProjectPrefix}-pipeline-CrossAccountSetupLambdaArn"
+      RoleArn: !Sub arn:aws:iam::${TestAwsAccountId}:role/${ProjectPrefix}-${TargetAccountRoleName}
+      StackName: !Sub ${AppName}-pipeline-${Branch}-test
+      Region: !Ref AWS::Region
+      CfnParameters:
+        SharedServiceAccountID: !Ref AWS::AccountId
+        AppName: !Ref AppName
+        Stage: test
+        Branch: !Ref Branch
+      Capabilities:
+        - CAPABILITY_NAMED_IAM
+      TemplateBody: |
+        AWSTemplateFormatVersion: '2010-09-09'
+
+        Parameters:
+          SharedServiceAccountID:
+            Description: The AWS Account ID for the shared services account
+            Type: String
+            AllowedPattern: (\d{12}|^$)
+            ConstraintDescription: must be an AWS account id
+          AppName:
+            Description: App name to use for stack resources
+            Type: String
+          Stage:
+            Description: Environment
+            Type: String
+          Branch:
+            Description: Branch used to build environment
+            Type: String
+
+        Resources:
+          PipelineServiceRole:
+            Type: AWS::IAM::Role
+            Properties:
+              RoleName: !Sub ${AppName}-PipelineServiceRole-${Branch}-${Stage}
+              Path: /
+              AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      AWS: !Ref SharedServiceAccountID
+                      Service:
+                        - codepipeline.amazonaws.com
+                    Action: sts:AssumeRole
+              Policies:
+                - PolicyName: CloudFormationAdminAccess
+                  PolicyDocument:
+                    Version: '2012-10-17'
+                    Statement:
+                      - Resource: "*"
+                        Effect: Allow
+                        Action:
+                          - cloudformation:*
+                      - Resource: "*"
+                        Effect: Allow
+                        Action:
+                          - s3:GetObject
+                      - Resource: !Sub arn:aws:kms:${AWS::Region}:${SharedServiceAccountID}:*
+                        Effect: Allow
+                        Action:
+                          - kms:Decrypt
+                      - Resource: 
+                        # - !GetAtt PipelineDeploymentRole.Arn
+                        - !Sub arn:aws:iam::${AWS::AccountId}:role/dph-pipeline-bp-role
+                        Effect: Allow
+                        Action:
+                          - iam:PassRole
+
+          PipelineDeploymentRole:
+            Type: AWS::IAM::Role
+            Properties:
+              RoleName: !Sub ${AppName}-PipelineDeploymentRole-${Branch}-${Stage}
+              Path: /
+              AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      AWS: !Ref SharedServiceAccountID
+                      Service:
+                        - cloudformation.amazonaws.com
+                    Action: sts:AssumeRole
+              ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/AdministratorAccess
+
+##########################################################################################################################
+# Cross Account Setup (PROD)
+##########################################################################################################################
+  ProdCrossAccountSetupStack:
+    Condition: IsRelease
+    Type: "AWS::CloudFormation::CustomResource"
+    Version: '1.0'
+    Properties:
+      ServiceToken:
+        Fn::ImportValue:
+          !Sub "${ProjectPrefix}-pipeline-CrossAccountSetupLambdaArn"
+      RoleArn: !Sub arn:aws:iam::${ProdAwsAccountId}:role/${ProjectPrefix}-${TargetAccountRoleName}
+      StackName: !Sub ${AppName}-pipeline-${Branch}-prod
+      Region: !Ref AWS::Region
+      CfnParameters:
+        SharedServiceAccountID: !Ref AWS::AccountId
+        AppName: !Ref AppName
+        Stage: prod
+        Branch: !Ref Branch
+      Capabilities:
+        - CAPABILITY_NAMED_IAM
+      TemplateBody: |
+        AWSTemplateFormatVersion: '2010-09-09'
+
+        Parameters:
+          SharedServiceAccountID:
+            Description: The AWS Account ID for the shared services account
+            Type: String
+            AllowedPattern: (\d{12}|^$)
+            ConstraintDescription: must be an AWS account id
+          AppName:
+            Description: App name to use for stack resources
+            Type: String
+          Stage:
+            Description: Environment
+            Type: String
+          Branch:
+            Description: Branch used to build environment
+            Type: String
+
+        Resources:
+          PipelineServiceRole:
+            Type: AWS::IAM::Role
+            Properties:
+              RoleName: !Sub ${AppName}-PipelineServiceRole-${Branch}-${Stage}
+              Path: /
+              AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      AWS: !Ref SharedServiceAccountID
+                      Service:
+                        - codepipeline.amazonaws.com
+                    Action: sts:AssumeRole
+              Policies:
+                - PolicyName: CloudFormationAdminAccess
+                  PolicyDocument:
+                    Version: '2012-10-17'
+                    Statement:
+                      - Resource: "*"
+                        Effect: Allow
+                        Action:
+                          - cloudformation:*
+                      - Resource: "*"
+                        Effect: Allow
+                        Action:
+                          - s3:GetObject
+                      - Resource: !Sub arn:aws:kms:${AWS::Region}:${SharedServiceAccountID}:*
+                        Effect: Allow
+                        Action:
+                          - kms:Decrypt
+                      - Resource: 
+                        # - !GetAtt PipelineDeploymentRole.Arn
+                        - !Sub arn:aws:iam::${AWS::AccountId}:role/dph-pipeline-bp-role
+                        Effect: Allow
+                        Action:
+                          - iam:PassRole
+          PipelineDeploymentRole:
+            Type: AWS::IAM::Role
+            Properties:
+              RoleName: !Sub ${AppName}-PipelineDeploymentRole-${Branch}-${Stage}
+              Path: /
+              AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      AWS: !Ref SharedServiceAccountID
+                      Service:
+                        - cloudformation.amazonaws.com
+                    Action: sts:AssumeRole
+              ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/AdministratorAccess

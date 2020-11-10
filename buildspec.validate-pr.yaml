@@ -1,0 +1,65 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 12
+
+    commands:
+      - STARTDATE=$(date)
+      - echo "Running install commands"
+      - pip3 install --upgrade awscli
+      - aws --version
+
+      # - echo "Installing dependencies"
+      # - npm install
+    finally:
+      - if [ "$CODEBUILD_BUILD_SUCCEEDING" -eq 1 ]; then echo "INSTALL SUCCESSFUL"; else echo "INSTALL FAILED"; exit 1; fi
+
+  pre_build:
+    commands:
+      - echo "Run unit tests"
+      # - npm run test -- --coverage --watchAll=false
+    finally:
+      - if [ "$CODEBUILD_BUILD_SUCCEEDING" -eq 1 ]; then echo "PREBUILD SUCCESSFUL"; else echo "PREBUILD FAILED"; exit 1; fi
+
+  build:
+    commands:
+      - echo "Building web app"
+      # - npm run build
+    finally:
+      - if [ "$CODEBUILD_BUILD_SUCCEEDING" -eq 1 ]; then echo "BUILD SUCCESSFUL"; else echo "BUILD FAILED"; exit 1; fi
+
+  post_build:
+    commands:
+      - env
+    finally:
+      ## Since there is no way to query the direct link to the Codebuild url, it is derived from variable subsitution in a pattern.
+      - CBUILD_PROJECT_NAME=$(echo ${CODEBUILD_BUILD_ARN} | cut -d '/' -f2 | cut -d':' -f1)
+      - AWS_ACCOUNT_ID=$(echo ${CODEBUILD_BUILD_ARN} | cut -d':' -f5)
+      - CBUILD_OUTPUT="https://console.aws.amazon.com/codesuite/codebuild/${AWS_ACCOUNT_ID}/projects/${CBUILD_PROJECT_NAME}/build/${CODEBUILD_BUILD_ID}/?region=${AWS_DEFAULT_REGION}"
+      ## Uncomment the line below to use the cloudwatch url in the PR comments
+      # - CBUILD_OUTPUT="Logs can be found here - $(aws codebuild batch-get-builds --ids ${CODEBUILD_BUILD_ID} | jq -r '.builds[].logs.deepLink')"
+      - content="Logs can be found here - ${CBUILD_OUTPUT}"
+      - content="${content} | Validation build started at ${STARTDATE} and ended at $(date)"
+      - |
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" -eq 1 ]; then
+          echo 'BUILD SUCCESSFUL'
+          aws codecommit update-pull-request-approval-state --pull-request-id $PULL_REQUEST_ID --approval-state APPROVE --revision-id $REVISION_ID;
+          aws codecommit post-comment-for-pull-request --pull-request-id $PULL_REQUEST_ID --repository-name $REPOSITORY_NAME --before-commit-id $DESTINATION_COMMIT --after-commit-id $SOURCE_COMMIT --content "$content"
+        else
+          aws codecommit update-pull-request-approval-state --pull-request-id $PULL_REQUEST_ID --approval-state REVOKE --revision-id $REVISION_ID;
+          aws codecommit post-comment-for-pull-request --pull-request-id $PULL_REQUEST_ID --repository-name $REPOSITORY_NAME --before-commit-id $DESTINATION_COMMIT --after-commit-id $SOURCE_COMMIT --content "$content"
+          echo 'BUILD FAILED'
+          exit 1
+        fi
+
+
+# reports: #TODO: Update path and verify report output
+#   UnitTestReports:
+#     files:
+#       - junit.xml # Support for Junit XML and JSON Cucumber format
+#     base-directory: '.'
+
+# artifacts:
+#   files: '**/*'

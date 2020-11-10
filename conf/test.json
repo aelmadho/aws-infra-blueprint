@@ -1,0 +1,8 @@
+{ 
+    "Parameters": {
+        "AppName": "dph-infra-blueprint",
+        "Environment": "test",
+        "Branch": "master",
+        "UserPool": "userpool-sample"
+    }
+}

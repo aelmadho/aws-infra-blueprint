@@ -1,0 +1,38 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure deployment pipeline version: v1.0'
+Parameters:
+  AppName:
+    Description: Name to be used across AWS resources provisioned by the stack
+    Type: String
+  Environment:
+    Description: Environment where this is deployed
+    Type: String
+  Branch:
+    Description: Branch where the source is located in CodeCommit
+    Type: String
+  UserPool:
+    Description: Name of the Cognito userpool to create
+    Type: String
+
+Resources:
+  UserPoolResource:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AppName}-${UserPool}-${Environment}-${Branch}"
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 90
+      Schema:
+        - AttributeDataType: "String"
+          Name: email
+          Required: true
+          Mutable: true
+      AutoVerifiedAttributes:
+        - email
+      EmailVerificationSubject: "Your  verification code"
+      EmailVerificationMessage: "Your  Project verification code is {####}"
